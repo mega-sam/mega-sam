@@ -28,6 +28,7 @@ import kornia
 from lietorch import SE3
 import numpy as np
 import torch
+from torch.utils.checkpoint import checkpoint
 
 
 def gradient_loss(gt, pred, u):
@@ -83,6 +84,7 @@ def sobel_fg_alpha(disp, mode="sobel", beta=10.0):
 
 ALPHA_MOTION = 0.25
 RESIZE_FACTOR = 0.5
+FLOW_BATCH_SIZE = 256
 
 
 def consistency_loss(
@@ -103,129 +105,178 @@ def consistency_loss(
     w_si=1.0,
     w_grad=2.0,
     w_normal=4.0,
+    flow_batch_size=FLOW_BATCH_SIZE,
 ):
   """Consistency loss."""
   _, H, W = disp_data.shape
+  device = disp_data.device
+  dtype = disp_data.dtype
   # mesh grid
-  xx = torch.arange(0, W).view(1, -1).repeat(H, 1)
-  yy = torch.arange(0, H).view(-1, 1).repeat(1, W)
-  xx = xx.view(1, 1, H, W)  # .repeat(B ,1 ,1 ,1)
-  yy = yy.view(1, 1, H, W)  # .repeat(B ,1 ,1 ,1)
-  grid = (
-      torch.cat((xx, yy), 1).float().cuda().permute(0, 2, 3, 1)
-  )  # [None, ...]
-
-  loss_flow = 0.0  # flow reprojection loss
-  loss_d_ratio = 0.0  # depth consistency loss
-
-  flows_step = flows.permute(0, 2, 3, 1)
-  flow_masks_step = flow_masks.permute(0, 2, 3, 1).squeeze(-1)
+  xx = torch.arange(0, W, device=device).view(1, -1).repeat(H, 1)
+  yy = torch.arange(0, H, device=device).view(-1, 1).repeat(1, W)
+  xx = xx.view(1, 1, H, W)
+  yy = yy.view(1, 1, H, W)
+  grid = torch.cat((xx, yy), 1).float().permute(0, 2, 3, 1)
 
   cam_1to2 = torch.bmm(
       torch.linalg.inv(torch.index_select(cam_c2w, dim=0, index=jj)),
       torch.index_select(cam_c2w, dim=0, index=ii),
   )
-
-  # warp disp from target time
-  pixel_locations = grid + flows_step
-  resize_factor = torch.tensor([W - 1.0, H - 1.0]).cuda()[None, None, None, ...]
-  normalized_pixel_locations = 2 * (pixel_locations / resize_factor) - 1.0
-
-  disp_sampled = torch.nn.functional.grid_sample(
-      torch.index_select(disp_data, dim=0, index=jj)[:, None, ...],
-      normalized_pixel_locations,
-      align_corners=True,
-  )
-
-  uu = torch.index_select(uncertainty, dim=0, index=ii).squeeze(1)
-
-  grid_h = torch.cat([grid, torch.ones_like(grid[..., 0:1])], dim=-1).unsqueeze(
-      -1
-  )
-  # depth of reference view
-  ref_depth = 1.0 / torch.clamp(
-      torch.index_select(disp_data, dim=0, index=ii), 1e-3, 1e3
-  )
-
-  pts_3d_ref = ref_depth[..., None, None] * (K_inv[None, None, None] @ grid_h)
-  rot = cam_1to2[:, None, None, :3, :3]
-  trans = cam_1to2[:, None, None, :3, 3:4]
-
-  pts_3d_tgt = (rot @ pts_3d_ref) + trans  # [:, None, None, :, None]
-  depth_tgt = pts_3d_tgt[:, :, :, 2:3, 0]
-  disp_tgt = 1.0 / torch.clamp(depth_tgt, 0.1, 1e3)
-
-  # flow consistency loss
-  pts_2D_tgt = K[None, None, None] @ pts_3d_tgt
-
-  flow_masks_step_ = flow_masks_step * (pts_2D_tgt[:, :, :, 2, 0] > 0.1)
-  pts_2D_tgt = pts_2D_tgt[:, :, :, :2, 0] / torch.clamp(
-      pts_2D_tgt[:, :, :, 2:, 0], 1e-3, 1e3
-  )
-
-  disp_sampled = torch.clamp(disp_sampled, 1e-3, 1e2)
-  disp_tgt = torch.clamp(disp_tgt, 1e-3, 1e2)
-
-  ratio = torch.maximum(
-      disp_sampled.squeeze() / disp_tgt.squeeze(),
-      disp_tgt.squeeze() / disp_sampled.squeeze(),
-  )
-  ratio_error = torch.abs(ratio - 1.0)  #
-
-  loss_d_ratio += torch.sum(
-      (ratio_error * uu + ALPHA_MOTION * torch.log(1.0 / uu)) * flow_masks_step_
-  ) / (torch.sum(flow_masks_step_) + 1e-8)
-
-  flow_error = torch.abs(pts_2D_tgt - pixel_locations)
-  loss_flow += torch.sum(
-      (
-          flow_error * uu[..., None]
-          + ALPHA_MOTION * torch.log(1.0 / uu[..., None])
-      )
-      * flow_masks_step_[..., None]
-  ) / (torch.sum(flow_masks_step_) * 2.0 + 1e-8)
-
-  # prior mono-depth reg loss
-  loss_prior = si_loss(init_disp, disp_data)
   KK = torch.inverse(K_inv)
 
-  # multi gradient consistency
-  disp_data_ds = disp_data[:, None, ...]
-  init_disp_ds = init_disp[:, None, ...]
-  K_rescale = KK.clone()
-  K_inv_rescale = torch.inverse(K_rescale)
-  pred_normal = compute_normals[0](
-      1.0 / torch.clamp(disp_data_ds, 1e-3, 1e3), K_inv_rescale[None]
-  )
-  init_normal = compute_normals[0](
-      1.0 / torch.clamp(init_disp_ds, 1e-3, 1e3), K_inv_rescale[None]
-  )
+  def _flow_block(
+      cam_1to2_batch,
+      flows_batch,
+      flow_masks_batch,
+      ii_batch,
+      jj_batch,
+      disp_data_,
+      init_disp_,
+      uncertainty_,
+  ):
+    """Flow/range block checkpoint."""
+    flows_step = flows_batch.permute(0, 2, 3, 1)
+    flow_masks_step = flow_masks_batch.permute(0, 2, 3, 1).squeeze(-1)
+    pixel_locations = grid + flows_step
+    resize_factor = torch.tensor([W - 1.0, H - 1.0], device=device)[
+        None, None, None, ...
+    ]
+    normalized_pixel_locations = 2 * (pixel_locations / resize_factor) - 1.0
 
-  loss_normal = torch.mean(
-      fg_alpha * (1.0 - torch.sum(pred_normal * init_normal, dim=1))
-  )  # / (1e-8 + torch.sum(fg_alpha))
+    disp_sampled = torch.nn.functional.grid_sample(
+        torch.index_select(disp_data_, dim=0, index=jj_batch)[:, None, ...],
+        normalized_pixel_locations,
+        align_corners=True,
+    )
 
-  loss_grad = 0.0
-  for scale in range(4):
-    interval = 2**scale
-    disp_data_ds = torch.nn.functional.interpolate(
-        disp_data[:, None, ...],
-        scale_factor=(1.0 / interval, 1.0 / interval),
-        mode="nearest-exact",
+    uu = torch.index_select(uncertainty_, dim=0, index=ii_batch).squeeze(1)
+
+    grid_h = torch.cat([grid, torch.ones_like(grid[..., 0:1])], dim=-1).unsqueeze(
+        -1
     )
-    init_disp_ds = torch.nn.functional.interpolate(
-        init_disp[:, None, ...],
-        scale_factor=(1.0 / interval, 1.0 / interval),
-        mode="nearest-exact",
+    ref_depth = 1.0 / torch.clamp(
+        torch.index_select(disp_data_, dim=0, index=ii_batch), 1e-3, 1e3
     )
-    uncertainty_rs = torch.nn.functional.interpolate(
+
+    pts_3d_ref = ref_depth[..., None, None] * (K_inv[None, None, None] @ grid_h)
+    rot = cam_1to2_batch[:, None, None, :3, :3]
+    trans = cam_1to2_batch[:, None, None, :3, 3:4]
+
+    pts_3d_tgt = (rot @ pts_3d_ref) + trans
+    depth_tgt = pts_3d_tgt[:, :, :, 2:3, 0]
+    disp_tgt = 1.0 / torch.clamp(depth_tgt, 0.1, 1e3)
+
+    pts_2D_tgt = K[None, None, None] @ pts_3d_tgt
+
+    flow_masks_step_ = flow_masks_step * (pts_2D_tgt[:, :, :, 2, 0] > 0.1)
+    pts_2D_tgt = pts_2D_tgt[:, :, :, :2, 0] / torch.clamp(
+        pts_2D_tgt[:, :, :, 2:, 0], 1e-3, 1e3
+    )
+
+    disp_sampled = torch.clamp(disp_sampled, 1e-3, 1e2)
+    disp_tgt = torch.clamp(disp_tgt, 1e-3, 1e2)
+
+    ratio = torch.maximum(
+        disp_sampled.squeeze() / disp_tgt.squeeze(),
+        disp_tgt.squeeze() / disp_sampled.squeeze(),
+    )
+    ratio_error = torch.abs(ratio - 1.0)
+
+    ratio_num = torch.sum(
+        (ratio_error * uu + ALPHA_MOTION * torch.log(1.0 / uu)) * flow_masks_step_
+    )
+    ratio_den = torch.sum(flow_masks_step_) + 1e-8
+
+    flow_error = torch.abs(pts_2D_tgt - pixel_locations)
+    flow_num = torch.sum(
+        (
+            flow_error * uu[..., None]
+            + ALPHA_MOTION * torch.log(1.0 / uu[..., None])
+        )
+        * flow_masks_step_[..., None]
+    )
+    flow_den = torch.sum(flow_masks_step_) * 2.0 + 1e-8
+
+    return ratio_num, ratio_den, flow_num, flow_den
+
+  def _surface_block(disp_data_, init_disp_, uncertainty_):
+    """Normals & gradient block checkpoint."""
+    disp_data_ds = disp_data_[:, None, ...]
+    init_disp_ds = init_disp_[:, None, ...]
+    K_rescale = KK.clone()
+    K_inv_rescale = torch.inverse(K_rescale)
+    pred_normal = compute_normals[0](
+        1.0 / torch.clamp(disp_data_ds, 1e-3, 1e3), K_inv_rescale[None]
+    )
+    init_normal = compute_normals[0](
+        1.0 / torch.clamp(init_disp_ds, 1e-3, 1e3), K_inv_rescale[None]
+    )
+
+    loss_normal = torch.mean(
+        fg_alpha * (1.0 - torch.sum(pred_normal * init_normal, dim=1))
+    )
+
+    loss_grad = 0.0
+    for scale in range(4):
+      interval = 2**scale
+      disp_data_ds = torch.nn.functional.interpolate(
+          disp_data_[:, None, ...],
+          scale_factor=(1.0 / interval, 1.0 / interval),
+          mode="nearest-exact",
+      )
+      init_disp_ds = torch.nn.functional.interpolate(
+          init_disp_[:, None, ...],
+          scale_factor=(1.0 / interval, 1.0 / interval),
+          mode="nearest-exact",
+      )
+      uncertainty_rs = torch.nn.functional.interpolate(
+          uncertainty_,
+          scale_factor=(1.0 / interval, 1.0 / interval),
+          mode="nearest-exact",
+      )
+      loss_grad += gradient_loss(
+          torch.log(disp_data_ds), torch.log(init_disp_ds), uncertainty_rs
+      )
+    return loss_normal, loss_grad
+
+  ratio_num_total = torch.zeros((), dtype=dtype, device=device)
+  ratio_den_total = torch.zeros((), dtype=dtype, device=device)
+  flow_num_total = torch.zeros((), dtype=dtype, device=device)
+  flow_den_total = torch.zeros((), dtype=dtype, device=device)
+
+  total_pairs = flows.shape[0]
+  for start in range(0, total_pairs, flow_batch_size):
+    end = min(total_pairs, start + flow_batch_size)
+    flows_batch = flows[start:end]
+    flow_masks_batch = flow_masks[start:end]
+    ii_batch = ii[start:end]
+    jj_batch = jj[start:end]
+    cam_1to2_batch = cam_1to2[start:end]
+    ratio_num, ratio_den, flow_num, flow_den = checkpoint(
+        _flow_block,
+        cam_1to2_batch,
+        flows_batch,
+        flow_masks_batch,
+        ii_batch,
+        jj_batch,
+        disp_data,
+        init_disp,
         uncertainty,
-        scale_factor=(1.0 / interval, 1.0 / interval),
-        mode="nearest-exact",
+        preserve_rng_state=False,
+        use_reentrant=False,
     )
-    loss_grad += gradient_loss(
-        torch.log(disp_data_ds), torch.log(init_disp_ds), uncertainty_rs
-    )
+    ratio_num_total += ratio_num
+    ratio_den_total += ratio_den
+    flow_num_total += flow_num
+    flow_den_total += flow_den
+
+  loss_d_ratio = ratio_num_total / (ratio_den_total + 1e-8)
+  loss_flow = flow_num_total / (flow_den_total + 1e-8)
+  loss_prior = si_loss(init_disp, disp_data)
+
+  loss_normal, loss_grad = checkpoint(
+      _surface_block, disp_data, init_disp, uncertainty
+  )
 
   return (
       w_ratio * loss_d_ratio
