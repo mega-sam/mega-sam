@@ -104,6 +104,9 @@ if __name__ == '__main__':
   image_list += sorted(
       glob.glob(os.path.join(args.datapath, '*.jpg'))
   )  # [::stride]
+  image_list += sorted(
+      glob.glob(os.path.join(args.datapath, '*.jpeg'))
+  )  # [::stride]
   img_data = []
 
   for t, (image_file) in tqdm.tqdm(enumerate(image_list)):

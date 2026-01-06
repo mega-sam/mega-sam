@@ -39,6 +39,13 @@ from lietorch import SE3
 import torch.nn.functional as F
 from droid import Droid
 
+def show_image(img):
+  img  = img.numpy()
+  c,w,h = img.shape
+  img = img.reshape((w,h,c))
+  import pdb; pdb.set_trace()
+  cv2.imshow("img", img)
+  cv2.waitKey()
 
 def image_stream(
     image_list,
@@ -201,6 +208,7 @@ if __name__ == "__main__":
 
   image_list = sorted(glob.glob(os.path.join("%s" % (args.datapath), "*.jpg")))
   image_list += sorted(glob.glob(os.path.join("%s" % (args.datapath), "*.png")))
+  image_list += sorted(glob.glob(os.path.join("%s" % (args.datapath), "*.jpeg")))
 
   # NOTE Mono is inverse depth, but metric-depth is depth!
   mono_disp_paths = sorted(
@@ -305,8 +313,8 @@ if __name__ == "__main__":
           K=K,
       )
   ):
-    if not args.disable_vis:
-      show_image(image[0])
+    # if not args.disable_vis:
+    #   show_image(image[0])
 
     rgb_list.append(image[0])
     senor_depth_list.append(depth)

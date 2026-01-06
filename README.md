@@ -101,6 +101,9 @@ Anaconda.
     modify datapath in the script):
     `./cvd_opt/cvd_opt_demo.sh`
 
+5.  Convert the optimized output to COLMAP text files:
+    `python export_to_colmap.py --npz outputs_cvd/<scene>_sgd_cvd_hr.npz --frames frames/<scene> --outdir colmap/<scene>`
+
 ### Contact
 
 For any questions related to our paper, please send email to zl548@cornell.edu.

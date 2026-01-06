@@ -24,6 +24,7 @@ def demo(model, args):
   # img_path_list = sorted(glob.glob("/home/zhengqili/filestore/DAVIS/DAVIS/JPEGImages/480p/%s/*.jpg"%scene_name))
   img_path_list = sorted(glob.glob(os.path.join(args.img_path, "*.jpg")))
   img_path_list += sorted(glob.glob(os.path.join(args.img_path, "*.png")))
+  img_path_list += sorted(glob.glob(os.path.join(args.img_path, "*.jpeg")))
 
   fovs = []
   for img_path in tqdm.tqdm(img_path_list):

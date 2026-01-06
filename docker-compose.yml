@@ -1,0 +1,34 @@
+services:
+  mega_sam:
+    command: /bin/bash
+    stdin_open: true
+    tty: true
+    build: .
+    image: mega_sam:cuda-12.4-1.0
+    network_mode: "host"
+    shm_size: 8gb
+    environment:
+      - DISPLAY=:0
+      - MESA_GL_VERSION_OVERRIDE=4.5 # Needed for running viewers
+    volumes:
+      # X11 socket mount - path determined by start.sh
+      - type: bind
+        source: ${X11_SOCKET_PATH:-/tmp/.X11-unix}
+        target: /tmp/.X11-unix
+      # This is needed to import your own datasets
+      - type: bind
+        source: ./
+        target: /mega_sam
+      - type: bind
+        source: ${DATASET_GS_PATH:-../datasets_gs}
+        target: /mega_sam/datasets_gs
+      - type: bind
+        source: ../torch_cache
+        target: /root/.cache
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

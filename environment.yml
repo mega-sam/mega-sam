@@ -8,8 +8,7 @@ dependencies:
   - python=3.10
   - pip
   - conda-forge::cudatoolkit=11.8
-  - pytorch::pytorch=2.0.1
-  - pytorch::torchvision==0.15.2
+  - intel-openmp
   - pip:
     - opencv-python-headless==4.9.0.80
     - tqdm==4.67.1
@@ -23,4 +22,3 @@ dependencies:
     - numpy==1.26.3
     - huggingface-hub==0.23.4
     - kornia==0.7.4
-    - torch-scatter==2.1.2

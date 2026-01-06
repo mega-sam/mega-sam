@@ -284,19 +284,19 @@ if __name__ == "__main__":
   K[1, 2] = intrinsics[3]
 
   img_data_pt = (
-      torch.from_numpy(np.ascontiguousarray(img_data)).float().cuda() / 255.0
+      torch.from_numpy(np.ascontiguousarray(img_data)).half().cuda() / 255.0
   )
-  flows = torch.from_numpy(np.ascontiguousarray(flows)).float().cuda()
+  flows = torch.from_numpy(np.ascontiguousarray(flows)).half().cuda()
   flow_masks = (
-      torch.from_numpy(np.ascontiguousarray(flow_masks)).float().cuda()
+      torch.from_numpy(np.ascontiguousarray(flow_masks)).half().cuda()
   )  # .unsqueeze(1)
   iijj = torch.from_numpy(np.ascontiguousarray(iijj)).float().cuda()
   ii = iijj[0, ...].long()
   jj = iijj[1, ...].long()
   K = torch.from_numpy(K).float().cuda()
 
-  init_disp = torch.from_numpy(disp_data).float().cuda()
-  disp_data = torch.from_numpy(disp_data).float().cuda()
+  init_disp = torch.from_numpy(disp_data).half().cuda()
+  disp_data = torch.from_numpy(disp_data).half().cuda()
 
   assert init_disp.shape == disp_data.shape
 

@@ -90,6 +90,7 @@ if __name__ == '__main__':
 
   filenames = sorted(glob.glob(os.path.join(args.img_path, '*.png')))
   filenames += sorted(glob.glob(os.path.join(args.img_path, '*.jpg')))
+  filenames += sorted(glob.glob(os.path.join(args.img_path, '*.jpeg')))
 
   final_results = []
   for filename in tqdm(filenames):
