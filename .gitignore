@@ -1,0 +1,13 @@
+# Model checkpoints (stored on S3, too large for git)
+checkpoints/
+
+# PyTorch Hub cache (DINOv2 for UniDepth, stored on S3 as tarball)
+torchhub/
+
+# Compiled CUDA extensions (built by compile_megasam_extensions.py, stored on S3)
+*.so
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
